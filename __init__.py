@@ -4,6 +4,106 @@ from aqt.utils import showText, tooltip
 import time
 import re
 
+# --- Class 1: The Result Window (Handles output and filtering) ---
+class UWorldResultDialog(QDialog):
+    def __init__(self, ids, batch_size, parent=None):
+        super().__init__(parent)
+        self.ids = ids # List of ID strings
+        self.batch_size = batch_size
+        self.setWindowTitle("UWorld IDs Found")
+        self.setMinimumSize(600, 500)
+        self.initUI()
+
+    def initUI(self):
+        layout = QVBoxLayout()
+        
+        # Instructions
+        lbl = QLabel("<b>Step 1:</b> Copy these IDs into UWorld.<br>"
+                     "<b>Step 2:</b> If UWorld gives an error about inactive questions, copy the error message.<br>"
+                     "<b>Step 3:</b> Click 'Remove Bad IDs' below and paste the error to clean this list.")
+        lbl.setWordWrap(True)
+        layout.addWidget(lbl)
+
+        # Text Area
+        self.text_area = QTextEdit()
+        self.text_area.setReadOnly(False)
+        layout.addWidget(self.text_area)
+        
+        # Render initial text
+        self.update_display()
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        
+        self.btn_filter = QPushButton("Remove Bad IDs from UWorld Error...")
+        self.btn_filter.clicked.connect(self.open_filter_dialog)
+        
+        self.btn_close = QPushButton("Close")
+        self.btn_close.clicked.connect(self.accept)
+        
+        btn_layout.addWidget(self.btn_filter)
+        btn_layout.addStretch()
+        btn_layout.addWidget(self.btn_close)
+        
+        layout.addLayout(btn_layout)
+        self.setLayout(layout)
+
+    def update_display(self):
+        if not self.ids:
+            self.text_area.setText("No IDs remaining.")
+            return
+
+        # Sort numerically
+        sorted_list = sorted(self.ids, key=lambda x: int(x))
+        total_ids = len(sorted_list)
+        
+        display_text = []
+        
+        # Chunk list into batches
+        for i in range(0, total_ids, self.batch_size):
+            chunk = sorted_list[i : i + self.batch_size]
+            batch_num = (i // self.batch_size) + 1
+            
+            header = f"--- Batch {batch_num} ({len(chunk)} IDs) ---"
+            ids_string = ", ".join(chunk)
+            
+            display_text.append(header)
+            display_text.append(ids_string)
+            display_text.append("") # Empty line for spacing
+
+        self.text_area.setText("\n".join(display_text))
+
+    def open_filter_dialog(self):
+        # Ask user for the error text
+        text, ok = QInputDialog.getMultiLineText(self, "Paste Error List", 
+            "Paste the full error message from UWorld here\n(e.g. 'Please remove the following questions... 2518, 4288'):")
+        
+        if ok and text:
+            self.remove_ids(text)
+
+    def remove_ids(self, error_text):
+        # Regex to find all sequences of digits in the error text
+        bad_ids = set(re.findall(r'\d+', error_text))
+        
+        if not bad_ids:
+            tooltip("No numbers found in the pasted text.")
+            return
+
+        original_count = len(self.ids)
+        
+        # Filter out the bad IDs
+        self.ids = [x for x in self.ids if x not in bad_ids]
+        
+        removed_count = original_count - len(self.ids)
+        
+        if removed_count > 0:
+            self.update_display()
+            tooltip(f"Successfully removed {removed_count} invalid IDs.")
+        else:
+            tooltip("None of the IDs in the error message were found in your current list.")
+
+
+# --- Class 2: The Setup Dialog (Timeframe & State) ---
 class UWorldReverseFetcher(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -107,6 +207,7 @@ class UWorldReverseFetcher(QDialog):
         
         return cutoff_ms, states, batch_size
 
+# --- Main Functions ---
 def run_uworld_fetcher():
     dialog = UWorldReverseFetcher(mw)
     if dialog.exec_():
@@ -165,27 +266,11 @@ def find_and_extract_ids(cutoff_ms, states, batch_size):
         except:
             continue
 
-    # --- Step 4: Output in Batches ---
+    # --- Step 4: Show Interactive Dialog ---
     if uworld_ids:
-        sorted_list = sorted(list(uworld_ids), key=lambda x: int(x))
-        total_ids = len(sorted_list)
-        
-        display_text = []
-        
-        # Chunk list into batches
-        for i in range(0, total_ids, batch_size):
-            chunk = sorted_list[i : i + batch_size]
-            batch_num = (i // batch_size) + 1
-            
-            header = f"--- Batch {batch_num} ({len(chunk)} IDs) ---"
-            ids_string = ", ".join(chunk)
-            
-            display_text.append(header)
-            display_text.append(ids_string)
-            display_text.append("") # Empty line for spacing
-
-        final_string = "\n".join(display_text)
-        showText(final_string, title=f"Found {total_ids} UWorld IDs")
+        # Pass the raw list to the dialog; the dialog handles sorting/batching/filtering
+        dialog = UWorldResultDialog(list(uworld_ids), batch_size, mw)
+        dialog.exec_()
     else:
         tooltip("Cards found, but no UWorld tags were detected.")
 
