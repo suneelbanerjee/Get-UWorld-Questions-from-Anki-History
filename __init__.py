@@ -2,16 +2,18 @@
 import os
 import time
 import re
+from datetime import datetime
 from aqt import mw
 from aqt.qt import *
 from aqt.utils import showText, tooltip
 
-# ============================================================
-# 1) FILE I/O HELPERS (Correct & Invalid Lists)
-# ============================================================
+# Global reference to keep the window alive (Modeless)
+history_window = None
 
+# ============================================================
+# 1) FILE I/O HELPERS
+# ============================================================
 def get_local_data_dir():
-    """Returns the user_data folder for THIS add-on (History Fetcher)."""
     addon_dir = os.path.dirname(os.path.abspath(__file__))
     data_dir = os.path.join(addon_dir, "user_data")
     if not os.path.exists(data_dir):
@@ -20,23 +22,17 @@ def get_local_data_dir():
     return data_dir
 
 def load_correct_ids_from_helper():
-    """
-    Looks for correct_questions.txt in the sibling 'UWorld_Helper' add-on folder.
-    """
     try:
         addons_dir = mw.addonManager.addonsFolder()
         target_path = os.path.join(addons_dir, "UWorld_Helper", "user_data", "correct_questions.txt")
-        
         if os.path.exists(target_path):
             with open(target_path, "r", encoding="utf-8") as f:
                 content = f.read()
                 return set(x.strip() for x in content.split(",") if x.strip().isdigit())
-    except Exception as e:
-        print(f"Error loading correct IDs: {e}")
+    except: pass
     return set()
 
 def load_invalid_ids():
-    """Loads locally saved invalid IDs (questions that error out)."""
     data_dir = get_local_data_dir()
     path = os.path.join(data_dir, "invalid_questions.txt")
     if os.path.exists(path):
@@ -48,15 +44,11 @@ def load_invalid_ids():
     return set()
 
 def save_invalid_ids(new_bad_ids):
-    """Saves new invalid IDs to the local blocklist."""
     if not new_bad_ids: return
-    
     data_dir = get_local_data_dir()
     path = os.path.join(data_dir, "invalid_questions.txt")
-    
     current_set = load_invalid_ids()
     current_set.update(new_bad_ids)
-    
     try:
         sorted_list = sorted(list(current_set), key=lambda x: int(x))
         with open(path, "w", encoding="utf-8") as f:
@@ -65,80 +57,281 @@ def save_invalid_ids(new_bad_ids):
         print(f"Error saving invalid IDs: {e}")
 
 # ============================================================
-# 2) Result Dialog (UI)
+# 2) THE UNIFIED DASHBOARD WINDOW
 # ============================================================
-class UWorldResultDialog(QDialog):
-    def __init__(self, ids, batch_size, stats=None, parent=None):
+class UWorldHistoryFetcher(QDialog):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.ids = ids 
-        self.batch_size = batch_size
-        self.stats = stats if stats else {}
-        self.setWindowTitle("UWorld IDs Found")
-        self.setMinimumSize(600, 500)
+        self.setWindowTitle("Get UWorld IDs from History")
+        self.setMinimumSize(550, 680)
+        
+        # State Data
+        self.all_found_ids = []  # Stores ALL valid IDs found by the search
+        self.displayed_ids = []  # Stores just the batch currently shown
+        
         self.initUI()
 
     def initUI(self):
-        layout = QVBoxLayout()
+        main_layout = QVBoxLayout()
+
+        # --- SECTION 1: SETTINGS ---
+        settings_group = QGroupBox("Search Settings")
+        settings_layout = QVBoxLayout()
         
-        # Header text
-        header = (
-            "<b>Step 1:</b> Copy these IDs into UWorld.<br>"
-            "<b>Step 2:</b> If UWorld errors, click 'Remove Bad IDs' and paste the error.<br>"
-            "<i>(Bad IDs will be saved and blocked forever)</i>"
-        )
+        # 1. Timeframe Selection
+        time_group_layout = QVBoxLayout()
         
-        # Add Filter Stats
-        filtered_msgs = []
-        if self.stats.get('correct_removed'):
-            filtered_msgs.append(f"{self.stats['correct_removed']} correct questions")
-        if self.stats.get('invalid_removed'):
-            filtered_msgs.append(f"{self.stats['invalid_removed']} invalid questions")
-            
-        if filtered_msgs:
-            header += f"<br><br><i>Automatically removed: {', '.join(filtered_msgs)}.</i>"
-            
-        lbl = QLabel(header)
-        lbl.setWordWrap(True)
-        layout.addWidget(lbl)
+        # Option A: Today
+        self.radio_today = QRadioButton("Reviewed Today")
+        self.radio_today.setChecked(True)
+        time_group_layout.addWidget(self.radio_today)
+        
+        # Option B: Last X Hours
+        hbox_hours = QHBoxLayout()
+        self.radio_hours = QRadioButton("Last:")
+        self.spin_hours = QSpinBox()
+        self.spin_hours.setRange(1, 1000)
+        self.spin_hours.setValue(4)
+        self.spin_hours.setSuffix(" hours")
+        hbox_hours.addWidget(self.radio_hours)
+        hbox_hours.addWidget(self.spin_hours)
+        hbox_hours.addStretch()
+        time_group_layout.addLayout(hbox_hours)
+        
+        # Option C: Date Range (NEW)
+        hbox_range = QHBoxLayout()
+        self.radio_range = QRadioButton("Between:")
+        
+        # Start Date
+        self.dt_start = QDateTimeEdit(QDateTime.currentDateTime().addDays(-1))
+        self.dt_start.setCalendarPopup(True)
+        self.dt_start.setDisplayFormat("MM/dd HH:mm")
+        
+        # End Date
+        self.dt_end = QDateTimeEdit(QDateTime.currentDateTime())
+        self.dt_end.setCalendarPopup(True)
+        self.dt_end.setDisplayFormat("MM/dd HH:mm")
+        
+        hbox_range.addWidget(self.radio_range)
+        hbox_range.addWidget(self.dt_start)
+        hbox_range.addWidget(QLabel("to"))
+        hbox_range.addWidget(self.dt_end)
+        hbox_range.addStretch()
+        time_group_layout.addLayout(hbox_range)
+        
+        settings_layout.addLayout(time_group_layout)
+        
+        # Divider line
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFrameShadow(QFrame.Shadow.Sunken)
+        settings_layout.addWidget(line)
+        
+        # 2. Checkboxes Grid
+        checks_layout = QGridLayout()
+        self.chk_learning = QCheckBox("Learning")
+        self.chk_learning.setChecked(True)
+        self.chk_young = QCheckBox("Young")
+        self.chk_young.setChecked(True)
+        self.chk_mature = QCheckBox("Mature")
+        self.chk_mature.setChecked(True)
+        self.chk_horizontal = QCheckBox("Tree Search (Horizontal)")
+        self.chk_horizontal.setToolTip("Finds ALL cards sharing IDs with your reviewed cards.")
+        self.chk_include_correct = QCheckBox("Include Correct Questions")
+        self.chk_include_correct.setToolTip("Include questions you already mastered in UWorld Helper.")
+        
+        checks_layout.addWidget(self.chk_learning, 0, 0)
+        checks_layout.addWidget(self.chk_young, 0, 1)
+        checks_layout.addWidget(self.chk_mature, 0, 2)
+        checks_layout.addWidget(self.chk_horizontal, 1, 0, 1, 2)
+        checks_layout.addWidget(self.chk_include_correct, 1, 2, 1, 2)
+        settings_layout.addLayout(checks_layout)
+        
+        # 3. Batch Size
+        batch_hbox = QHBoxLayout()
+        batch_hbox.addWidget(QLabel("Output Limit (Batch Size):"))
+        self.spin_limit = QSpinBox()
+        self.spin_limit.setRange(1, 1000)
+        self.spin_limit.setValue(40) # Default to 40
+        batch_hbox.addWidget(self.spin_limit)
+        batch_hbox.addStretch()
+        settings_layout.addLayout(batch_hbox)
+        
+        settings_group.setLayout(settings_layout)
+        main_layout.addWidget(settings_group)
+
+        # --- SECTION 2: ACTION BUTTON ---
+        self.btn_generate = QPushButton("Generate Question List")
+        self.btn_generate.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_generate.setStyleSheet("font-weight: bold; padding: 8px; font-size: 14px;")
+        self.btn_generate.clicked.connect(self.run_search)
+        main_layout.addWidget(self.btn_generate)
+
+        # --- SECTION 3: OUTPUT ---
+        self.lbl_status = QLabel("Ready to search.")
+        self.lbl_status.setStyleSheet("color: gray; font-style: italic; margin-top: 5px;")
+        main_layout.addWidget(self.lbl_status)
 
         self.text_area = QTextEdit()
-        self.text_area.setReadOnly(False)
-        layout.addWidget(self.text_area)
-        
-        self.update_display()
+        self.text_area.setPlaceholderText("Questions will appear here...")
+        main_layout.addWidget(self.text_area)
 
-        btn_layout = QHBoxLayout()
+        # --- SECTION 4: FILTERING ---
+        filter_hbox = QHBoxLayout()
         self.btn_filter = QPushButton("Remove Bad IDs from Error...")
         self.btn_filter.clicked.connect(self.open_filter_dialog)
-        self.btn_close = QPushButton("Close")
-        self.btn_close.clicked.connect(self.accept)
+        self.btn_filter.setToolTip("Paste a UWorld error message here to permanently block those IDs.")
         
-        btn_layout.addWidget(self.btn_filter)
-        btn_layout.addStretch()
-        btn_layout.addWidget(self.btn_close)
+        self.btn_copy = QPushButton("Copy to Clipboard")
+        self.btn_copy.clicked.connect(self.copy_to_clipboard)
         
-        layout.addLayout(btn_layout)
-        self.setLayout(layout)
+        filter_hbox.addWidget(self.btn_filter)
+        filter_hbox.addStretch()
+        filter_hbox.addWidget(self.btn_copy)
+        main_layout.addLayout(filter_hbox)
 
-    def update_display(self):
-        if not self.ids:
-            self.text_area.setText("No IDs remaining.")
-            return
+        self.setLayout(main_layout)
 
-        sorted_list = sorted(self.ids, key=lambda x: int(x))
-        total_ids = len(sorted_list)
+    # ================= LOGIC =================
+
+    def run_search(self):
+        # 1. Get Time Parameters
+        if self.radio_today.isChecked():
+            start_ms = (mw.col.sched.day_cutoff - 86400) * 1000
+            end_ms = time.time() * 1000 # Now
+        elif self.radio_hours.isChecked():
+            start_ms = (time.time() - (self.spin_hours.value() * 3600)) * 1000
+            end_ms = time.time() * 1000
+        else:
+            # Range Selection (Convert QDateTime to MS Timestamp)
+            start_ms = self.dt_start.dateTime().toMSecsSinceEpoch()
+            end_ms = self.dt_end.dateTime().toMSecsSinceEpoch()
+
+        states = {
+            "learning": self.chk_learning.isChecked(),
+            "young": self.chk_young.isChecked(),
+            "mature": self.chk_mature.isChecked()
+        }
         
-        display_text = []
-        for i in range(0, total_ids, self.batch_size):
-            chunk = sorted_list[i : i + self.batch_size]
-            batch_num = (i // self.batch_size) + 1
-            header = f"--- Batch {batch_num} ({len(chunk)} IDs) ---"
-            ids_string = ", ".join(chunk)
-            display_text.append(header)
-            display_text.append(ids_string)
-            display_text.append("") 
+        horizontal_mode = self.chk_horizontal.isChecked()
+        include_correct = self.chk_include_correct.isChecked()
 
-        self.text_area.setText("\n".join(display_text))
+        # 2. Find IDs (Pass tuple of start/end)
+        final_ids = self.find_ids_logic((start_ms, end_ms), states, horizontal_mode)
+        
+        # 3. Initial Filtering (Correct & Invalid)
+        stats = {'found': len(final_ids), 'removed_correct': 0, 'removed_invalid': 0}
+        
+        # A. Filter Correct
+        if not include_correct:
+            correct_ids = load_correct_ids_from_helper()
+            start_len = len(final_ids)
+            final_ids = final_ids - correct_ids
+            stats['removed_correct'] = start_len - len(final_ids)
+            
+        # B. Filter Invalid (Blocklist)
+        invalid_ids = load_invalid_ids()
+        start_len = len(final_ids)
+        final_ids = final_ids - invalid_ids
+        stats['removed_invalid'] = start_len - len(final_ids)
+        
+        # 4. Store & Display
+        self.all_found_ids = sorted(list(final_ids), key=lambda x: int(x))
+        self.refresh_display(update_timestamp=True, stats=stats)
+
+
+    def find_ids_logic(self, time_range, states, horizontal_mode):
+        start_ms, end_ms = time_range
+        
+        # Identify Reviewed Cards in RANGE
+        query = f"SELECT DISTINCT cid FROM revlog WHERE id >= {int(start_ms)} AND id <= {int(end_ms)}"
+        card_ids = mw.col.db.list(query)
+        if not card_ids: return set()
+
+        # Filter by State
+        seed_nids = set()
+        for cid in card_ids:
+            try:
+                c = mw.col.get_card(cid)
+                is_learning = c.queue in (1, 3)
+                is_review = c.queue == 2
+                is_young = is_review and c.ivl < 21
+                is_mature = is_review and c.ivl >= 21
+                
+                keep = False
+                if is_learning and states['learning']: keep = True
+                elif is_young and states['young']: keep = True
+                elif is_mature and states['mature']: keep = True
+                
+                if keep: seed_nids.add(c.nid)
+            except: continue
+        
+        if not seed_nids: return set()
+
+        # Extract UWorld IDs
+        seed_uworld_ids = set()
+        tag_regex = re.compile(r"(?i)UWorld.*::Step.*::(\d+)$")
+
+        for nid in seed_nids:
+            try:
+                note = mw.col.get_note(nid)
+                for tag in note.tags:
+                    match = tag_regex.search(tag)
+                    if match: seed_uworld_ids.add(match.group(1))
+            except: continue
+
+        # Horizontal Expansion
+        final_ids = seed_uworld_ids
+        if horizontal_mode and seed_uworld_ids:
+            expanded_nids = set()
+            for qid in seed_uworld_ids:
+                ids_notes = mw.col.find_notes(f"tag:*UWorld*Step*::{qid}")
+                expanded_nids.update(ids_notes)
+            
+            expanded_uworld_ids = set()
+            for nid in expanded_nids:
+                try:
+                    note = mw.col.get_note(nid)
+                    for tag in note.tags:
+                        match = tag_regex.search(tag)
+                        if match: expanded_uworld_ids.add(match.group(1))
+                except: continue
+            final_ids = expanded_uworld_ids
+            
+        return final_ids
+
+    def refresh_display(self, update_timestamp=False, stats=None):
+        limit = self.spin_limit.value()
+        
+        # Slice the list to the requested batch size
+        self.displayed_ids = self.all_found_ids[:limit]
+        
+        # Update Text Area
+        if self.displayed_ids:
+            self.text_area.setPlainText(", ".join(self.displayed_ids))
+        else:
+            self.text_area.setPlainText("No IDs found matching criteria.")
+
+        # Update Status Label
+        if update_timestamp:
+            t_str = datetime.now().strftime("%I:%M %p")
+            count = len(self.all_found_ids)
+            msg = f"Generated at {t_str}. Found {count} total valid IDs."
+            
+            if stats:
+                details = []
+                if stats['removed_correct']: details.append(f"{stats['removed_correct']} correct hidden")
+                if stats['removed_invalid']: details.append(f"{stats['removed_invalid']} invalid hidden")
+                if details: msg += f" ({', '.join(details)})"
+                
+            if count > limit:
+                msg += f" <b>Showing first {limit}.</b>"
+                
+            self.lbl_status.setText(msg)
+        else:
+            # Simple refresh (e.g. after removing bad IDs)
+            count = len(self.all_found_ids)
+            self.lbl_status.setText(f"List updated. {count} valid IDs remaining. Showing first {limit}.")
 
     def open_filter_dialog(self):
         text, ok = QInputDialog.getMultiLineText(self, "Paste Error List", 
@@ -152,227 +345,39 @@ class UWorldResultDialog(QDialog):
             tooltip("No numbers found in the pasted text.")
             return
 
-        # 1. Save these bad IDs to disk immediately
+        # 1. Save to permanent blocklist
         save_invalid_ids(bad_ids)
-
-        # 2. Remove from current view
-        original_count = len(self.ids)
-        self.ids = [x for x in self.ids if x not in bad_ids]
-        removed_count = original_count - len(self.ids)
         
+        # 2. Remove from CURRENT session memory
+        original_count = len(self.all_found_ids)
+        self.all_found_ids = [x for x in self.all_found_ids if x not in bad_ids]
+        removed_count = original_count - len(self.all_found_ids)
+        
+        # 3. Refresh display (Auto-refill the batch)
         if removed_count > 0:
-            self.update_display()
-            tooltip(f"Removed {removed_count} invalid IDs and saved them to blocklist.")
+            self.refresh_display()
+            tooltip(f"Removed {removed_count} IDs and refilled the list.")
         else:
-            tooltip("IDs saved to blocklist (none were in current list).")
+            tooltip("Those IDs were not in the current list, but they have been saved to the blocklist.")
+
+    def copy_to_clipboard(self):
+        mw.app.clipboard().setText(self.text_area.toPlainText())
+        tooltip("Copied!")
 
 # ============================================================
-# 3) Setup Dialog (Config)
-# ============================================================
-class UWorldReverseFetcher(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Get UWorld IDs from Reviewed Cards")
-        self.setMinimumWidth(450)
-        self.initUI()
-
-    def initUI(self):
-        layout = QVBoxLayout()
-
-        # 1. Timeframe
-        time_group = QGroupBox("1. Timeframe")
-        time_layout = QVBoxLayout()
-        self.radio_today = QRadioButton("Reviewed Today")
-        self.radio_today.setChecked(True)
-        self.radio_hours = QRadioButton("Reviewed in the last:")
-        self.spin_hours = QSpinBox()
-        self.spin_hours.setRange(1, 1000)
-        self.spin_hours.setValue(4)
-        self.spin_hours.setSuffix(" hours")
-        
-        h_layout = QHBoxLayout()
-        h_layout.addWidget(self.radio_hours)
-        h_layout.addWidget(self.spin_hours)
-        h_layout.addStretch()
-        time_layout.addWidget(self.radio_today)
-        time_layout.addLayout(h_layout)
-        time_group.setLayout(time_layout)
-        layout.addWidget(time_group)
-
-        # 2. State
-        state_group = QGroupBox("2. Card State")
-        state_layout = QVBoxLayout()
-        self.chk_learning = QCheckBox("Learning / Relearning")
-        self.chk_learning.setChecked(True)
-        self.chk_young = QCheckBox("Young (< 21 days)")
-        self.chk_young.setChecked(True)
-        self.chk_mature = QCheckBox("Mature (>= 21 days)")
-        self.chk_mature.setChecked(True)
-        state_layout.addWidget(self.chk_learning)
-        state_layout.addWidget(self.chk_young)
-        state_layout.addWidget(self.chk_mature)
-        state_group.setLayout(state_layout)
-        layout.addWidget(state_group)
-
-        # 3. Search Mode
-        search_group = QGroupBox("3. Search Logic")
-        search_layout = QVBoxLayout()
-        
-        self.chk_horizontal = QCheckBox("Enable Horizontal Search (Tree Search)")
-        self.chk_horizontal.setToolTip("Finds ALL cards sharing IDs with your reviewed cards.")
-        self.chk_horizontal.setChecked(False) 
-        search_layout.addWidget(self.chk_horizontal)
-
-        self.chk_include_correct = QCheckBox("Include questions previously answered correctly")
-        self.chk_include_correct.setToolTip("Check to re-do questions you already mastered.")
-        self.chk_include_correct.setChecked(False) 
-        search_layout.addWidget(self.chk_include_correct)
-
-        search_group.setLayout(search_layout)
-        layout.addWidget(search_group)
-
-        # 4. Output
-        output_group = QGroupBox("4. Output Settings")
-        output_layout = QHBoxLayout()
-        output_layout.addWidget(QLabel("Batch Size:"))
-        self.spin_batch = QSpinBox()
-        self.spin_batch.setRange(1, 1000)
-        self.spin_batch.setValue(40)
-        output_layout.addWidget(self.spin_batch)
-        output_layout.addStretch()
-        output_group.setLayout(output_layout)
-        layout.addWidget(output_group)
-
-        # Buttons
-        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        btn_box.accepted.connect(self.accept)
-        btn_box.rejected.connect(self.reject)
-        layout.addWidget(btn_box)
-        self.setLayout(layout)
-
-    def get_query_parameters(self):
-        if self.radio_today.isChecked():
-            cutoff_ms = (mw.col.sched.day_cutoff - 86400) * 1000
-        else:
-            cutoff_ms = (time.time() - (self.spin_hours.value() * 3600)) * 1000
-
-        states = {
-            "learning": self.chk_learning.isChecked(),
-            "young": self.chk_young.isChecked(),
-            "mature": self.chk_mature.isChecked()
-        }
-        
-        return cutoff_ms, states, self.spin_batch.value(), self.chk_horizontal.isChecked(), self.chk_include_correct.isChecked()
-
-# ============================================================
-# 4) Main Logic
+# 3) ENTRY POINT
 # ============================================================
 def run_uworld_fetcher():
-    dialog = UWorldReverseFetcher(mw)
-    if dialog.exec_():
-        cutoff_ms, states, batch_size, horizontal_mode, include_correct = dialog.get_query_parameters()
-        find_and_extract_ids(cutoff_ms, states, batch_size, horizontal_mode, include_correct)
-
-def find_and_extract_ids(cutoff_ms, states, batch_size, horizontal_mode, include_correct):
-    # 1. Identify Reviewed Cards
-    query = f"SELECT DISTINCT cid FROM revlog WHERE id > {int(cutoff_ms)}"
-    card_ids = mw.col.db.list(query)
-
-    if not card_ids:
-        tooltip("No cards reviewed in this timeframe.")
-        return
-
-    # 2. Filter by State -> Get Seed NIDs
-    seed_nids = set()
-    for cid in card_ids:
-        try:
-            c = mw.col.get_card(cid)
-            is_learning = c.queue in (1, 3)
-            is_review = c.queue == 2
-            is_young = is_review and c.ivl < 21
-            is_mature = is_review and c.ivl >= 21
-            
-            keep = False
-            if is_learning and states['learning']: keep = True
-            elif is_young and states['young']: keep = True
-            elif is_mature and states['mature']: keep = True
-            
-            if keep:
-                seed_nids.add(c.nid)
-        except: continue
-
-    if not seed_nids:
-        tooltip("Cards found, but none matched the State criteria.")
-        return
-
-    # 3. Extract Seed IDs
-    seed_uworld_ids = set()
-    tag_regex = re.compile(r"(?i)UWorld.*::Step.*::(\d+)$")
-
-    for nid in seed_nids:
-        try:
-            note = mw.col.get_note(nid)
-            for tag in note.tags:
-                match = tag_regex.search(tag)
-                if match:
-                    seed_uworld_ids.add(match.group(1))
-        except: continue
-            
-    if not seed_uworld_ids:
-        tooltip("Reviewed cards found, but they had no valid UWorld::Step tags.")
-        return
-
-    final_ids = seed_uworld_ids
-
-    # 4. Horizontal Expansion
-    if horizontal_mode:
-        expanded_nids = set()
-        for qid in seed_uworld_ids:
-            ids_notes = mw.col.find_notes(f"tag:*UWorld*Step*::{qid}")
-            expanded_nids.update(ids_notes)
-            
-        expanded_uworld_ids = set()
-        for nid in expanded_nids:
-            try:
-                note = mw.col.get_note(nid)
-                for tag in note.tags:
-                    match = tag_regex.search(tag)
-                    if match:
-                        expanded_uworld_ids.add(match.group(1))
-            except: continue
-        final_ids = expanded_uworld_ids
-
-    # 5. FILTERS (Correct & Invalid)
-    original_count = len(final_ids)
-    stats = {'correct_removed': 0, 'invalid_removed': 0}
+    global history_window
     
-    # A. Filter Correct (from Helper)
-    if not include_correct:
-        correct_ids = load_correct_ids_from_helper()
-        before_correct = len(final_ids)
-        final_ids = final_ids - correct_ids
-        stats['correct_removed'] = before_correct - len(final_ids)
-
-    # B. Filter Invalid (from Blocklist) - Always active
-    invalid_ids = load_invalid_ids()
-    before_invalid = len(final_ids)
-    final_ids = final_ids - invalid_ids
-    stats['invalid_removed'] = before_invalid - len(final_ids)
-
-    # 6. Output
-    if final_ids:
-        dialog = UWorldResultDialog(list(final_ids), batch_size, stats, mw)
-        dialog.exec_()
-    else:
-        # User feedback if everything was filtered
-        msg = []
-        if stats['correct_removed']: msg.append(f"{stats['correct_removed']} correct")
-        if stats['invalid_removed']: msg.append(f"{stats['invalid_removed']} invalid")
-        
-        if msg:
-            tooltip(f"All found questions were skipped! ({', '.join(msg)})")
-        else:
-            tooltip("No UWorld Step IDs found.")
+    # Create window if it doesn't exist
+    if not history_window:
+        history_window = UWorldHistoryFetcher(mw)
+    
+    # Show and bring to front (Modeless - allows interaction with other windows)
+    history_window.show()
+    history_window.raise_()
+    history_window.activateWindow()
 
 # Add to Tools Menu
 action = QAction("Get UWorld IDs from History", mw)
