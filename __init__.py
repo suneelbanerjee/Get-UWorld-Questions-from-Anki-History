@@ -1,15 +1,78 @@
+# -*- coding: utf-8 -*-
+import os
+import time
+import re
 from aqt import mw
 from aqt.qt import *
 from aqt.utils import showText, tooltip
-import time
-import re
 
-# --- Class 1: The Result Window (Handles output and filtering) ---
+# ============================================================
+# 1) FILE I/O HELPERS (Correct & Invalid Lists)
+# ============================================================
+
+def get_local_data_dir():
+    """Returns the user_data folder for THIS add-on (History Fetcher)."""
+    addon_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.join(addon_dir, "user_data")
+    if not os.path.exists(data_dir):
+        try: os.makedirs(data_dir)
+        except: pass
+    return data_dir
+
+def load_correct_ids_from_helper():
+    """
+    Looks for correct_questions.txt in the sibling 'UWorld_Helper' add-on folder.
+    """
+    try:
+        addons_dir = mw.addonManager.addonsFolder()
+        target_path = os.path.join(addons_dir, "UWorld_Helper", "user_data", "correct_questions.txt")
+        
+        if os.path.exists(target_path):
+            with open(target_path, "r", encoding="utf-8") as f:
+                content = f.read()
+                return set(x.strip() for x in content.split(",") if x.strip().isdigit())
+    except Exception as e:
+        print(f"Error loading correct IDs: {e}")
+    return set()
+
+def load_invalid_ids():
+    """Loads locally saved invalid IDs (questions that error out)."""
+    data_dir = get_local_data_dir()
+    path = os.path.join(data_dir, "invalid_questions.txt")
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+                return set(x.strip() for x in content.split(",") if x.strip().isdigit())
+        except: pass
+    return set()
+
+def save_invalid_ids(new_bad_ids):
+    """Saves new invalid IDs to the local blocklist."""
+    if not new_bad_ids: return
+    
+    data_dir = get_local_data_dir()
+    path = os.path.join(data_dir, "invalid_questions.txt")
+    
+    current_set = load_invalid_ids()
+    current_set.update(new_bad_ids)
+    
+    try:
+        sorted_list = sorted(list(current_set), key=lambda x: int(x))
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(", ".join(sorted_list))
+    except Exception as e:
+        print(f"Error saving invalid IDs: {e}")
+
+# ============================================================
+# 2) Result Dialog (UI)
+# ============================================================
 class UWorldResultDialog(QDialog):
-    def __init__(self, ids, batch_size, parent=None):
+    def __init__(self, ids, batch_size, stats=None, parent=None):
         super().__init__(parent)
         self.ids = ids 
         self.batch_size = batch_size
+        self.stats = stats if stats else {}
         self.setWindowTitle("UWorld IDs Found")
         self.setMinimumSize(600, 500)
         self.initUI()
@@ -17,9 +80,24 @@ class UWorldResultDialog(QDialog):
     def initUI(self):
         layout = QVBoxLayout()
         
-        lbl = QLabel("<b>Step 1:</b> Copy these IDs into UWorld.<br>"
-                     "<b>Step 2:</b> If UWorld errors on inactive questions, copy the error message.<br>"
-                     "<b>Step 3:</b> Click 'Remove Bad IDs' below and paste the error.")
+        # Header text
+        header = (
+            "<b>Step 1:</b> Copy these IDs into UWorld.<br>"
+            "<b>Step 2:</b> If UWorld errors, click 'Remove Bad IDs' and paste the error.<br>"
+            "<i>(Bad IDs will be saved and blocked forever)</i>"
+        )
+        
+        # Add Filter Stats
+        filtered_msgs = []
+        if self.stats.get('correct_removed'):
+            filtered_msgs.append(f"{self.stats['correct_removed']} correct questions")
+        if self.stats.get('invalid_removed'):
+            filtered_msgs.append(f"{self.stats['invalid_removed']} invalid questions")
+            
+        if filtered_msgs:
+            header += f"<br><br><i>Automatically removed: {', '.join(filtered_msgs)}.</i>"
+            
+        lbl = QLabel(header)
         lbl.setWordWrap(True)
         layout.addWidget(lbl)
 
@@ -74,18 +152,23 @@ class UWorldResultDialog(QDialog):
             tooltip("No numbers found in the pasted text.")
             return
 
+        # 1. Save these bad IDs to disk immediately
+        save_invalid_ids(bad_ids)
+
+        # 2. Remove from current view
         original_count = len(self.ids)
         self.ids = [x for x in self.ids if x not in bad_ids]
         removed_count = original_count - len(self.ids)
         
         if removed_count > 0:
             self.update_display()
-            tooltip(f"Removed {removed_count} invalid IDs.")
+            tooltip(f"Removed {removed_count} invalid IDs and saved them to blocklist.")
         else:
-            tooltip("No matching IDs found to remove.")
+            tooltip("IDs saved to blocklist (none were in current list).")
 
-
-# --- Class 2: The Setup Dialog ---
+# ============================================================
+# 3) Setup Dialog (Config)
+# ============================================================
 class UWorldReverseFetcher(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -136,13 +219,15 @@ class UWorldReverseFetcher(QDialog):
         search_layout = QVBoxLayout()
         
         self.chk_horizontal = QCheckBox("Enable Horizontal Search (Tree Search)")
-        self.chk_horizontal.setToolTip(
-            "If Checked: Finds ALL cards that share a UWorld ID with your reviewed cards,\n"
-            "then grabs ALL UWorld IDs from those cards too."
-        )
+        self.chk_horizontal.setToolTip("Finds ALL cards sharing IDs with your reviewed cards.")
         self.chk_horizontal.setChecked(False) 
-        
         search_layout.addWidget(self.chk_horizontal)
+
+        self.chk_include_correct = QCheckBox("Include questions previously answered correctly")
+        self.chk_include_correct.setToolTip("Check to re-do questions you already mastered.")
+        self.chk_include_correct.setChecked(False) 
+        search_layout.addWidget(self.chk_include_correct)
+
         search_group.setLayout(search_layout)
         layout.addWidget(search_group)
 
@@ -177,15 +262,18 @@ class UWorldReverseFetcher(QDialog):
             "mature": self.chk_mature.isChecked()
         }
         
-        return cutoff_ms, states, self.spin_batch.value(), self.chk_horizontal.isChecked()
+        return cutoff_ms, states, self.spin_batch.value(), self.chk_horizontal.isChecked(), self.chk_include_correct.isChecked()
 
+# ============================================================
+# 4) Main Logic
+# ============================================================
 def run_uworld_fetcher():
     dialog = UWorldReverseFetcher(mw)
     if dialog.exec_():
-        cutoff_ms, states, batch_size, horizontal_mode = dialog.get_query_parameters()
-        find_and_extract_ids(cutoff_ms, states, batch_size, horizontal_mode)
+        cutoff_ms, states, batch_size, horizontal_mode, include_correct = dialog.get_query_parameters()
+        find_and_extract_ids(cutoff_ms, states, batch_size, horizontal_mode, include_correct)
 
-def find_and_extract_ids(cutoff_ms, states, batch_size, horizontal_mode):
+def find_and_extract_ids(cutoff_ms, states, batch_size, horizontal_mode, include_correct):
     # 1. Identify Reviewed Cards
     query = f"SELECT DISTINCT cid FROM revlog WHERE id > {int(cutoff_ms)}"
     card_ids = mw.col.db.list(query)
@@ -211,8 +299,7 @@ def find_and_extract_ids(cutoff_ms, states, batch_size, horizontal_mode):
             
             if keep:
                 seed_nids.add(c.nid)
-        except:
-            continue
+        except: continue
 
     if not seed_nids:
         tooltip("Cards found, but none matched the State criteria.")
@@ -220,9 +307,6 @@ def find_and_extract_ids(cutoff_ms, states, batch_size, horizontal_mode):
 
     # 3. Extract Seed IDs
     seed_uworld_ids = set()
-    # UPDATED REGEX: Requires "UWorld" AND "Step" in the tag name
-    # e.g. matches #AK...::#UWorld::Step::1234
-    # e.g. ignores #AK...::#UWorld::Shelf::1234
     tag_regex = re.compile(r"(?i)UWorld.*::Step.*::(\d+)$")
 
     for nid in seed_nids:
@@ -232,8 +316,7 @@ def find_and_extract_ids(cutoff_ms, states, batch_size, horizontal_mode):
                 match = tag_regex.search(tag)
                 if match:
                     seed_uworld_ids.add(match.group(1))
-        except:
-            continue
+        except: continue
             
     if not seed_uworld_ids:
         tooltip("Reviewed cards found, but they had no valid UWorld::Step tags.")
@@ -241,15 +324,10 @@ def find_and_extract_ids(cutoff_ms, states, batch_size, horizontal_mode):
 
     final_ids = seed_uworld_ids
 
-    # 4. Horizontal Expansion (Tree Search)
+    # 4. Horizontal Expansion
     if horizontal_mode:
         expanded_nids = set()
-        
-        # We need to find notes that share the SAME exact Step IDs we just found
         for qid in seed_uworld_ids:
-            # We use a wildcard search for tags containing that ID
-            # But we must ensure the search query targets the Step tag specifically
-            # This search finds notes having tag: ...UWorld...Step...[QID]
             ids_notes = mw.col.find_notes(f"tag:*UWorld*Step*::{qid}")
             expanded_nids.update(ids_notes)
             
@@ -258,21 +336,43 @@ def find_and_extract_ids(cutoff_ms, states, batch_size, horizontal_mode):
             try:
                 note = mw.col.get_note(nid)
                 for tag in note.tags:
-                    # Apply the same strict regex to the expanded cards
                     match = tag_regex.search(tag)
                     if match:
                         expanded_uworld_ids.add(match.group(1))
-            except:
-                continue
-        
+            except: continue
         final_ids = expanded_uworld_ids
 
-    # 5. Output
+    # 5. FILTERS (Correct & Invalid)
+    original_count = len(final_ids)
+    stats = {'correct_removed': 0, 'invalid_removed': 0}
+    
+    # A. Filter Correct (from Helper)
+    if not include_correct:
+        correct_ids = load_correct_ids_from_helper()
+        before_correct = len(final_ids)
+        final_ids = final_ids - correct_ids
+        stats['correct_removed'] = before_correct - len(final_ids)
+
+    # B. Filter Invalid (from Blocklist) - Always active
+    invalid_ids = load_invalid_ids()
+    before_invalid = len(final_ids)
+    final_ids = final_ids - invalid_ids
+    stats['invalid_removed'] = before_invalid - len(final_ids)
+
+    # 6. Output
     if final_ids:
-        dialog = UWorldResultDialog(list(final_ids), batch_size, mw)
+        dialog = UWorldResultDialog(list(final_ids), batch_size, stats, mw)
         dialog.exec_()
     else:
-        tooltip("No UWorld Step IDs found.")
+        # User feedback if everything was filtered
+        msg = []
+        if stats['correct_removed']: msg.append(f"{stats['correct_removed']} correct")
+        if stats['invalid_removed']: msg.append(f"{stats['invalid_removed']} invalid")
+        
+        if msg:
+            tooltip(f"All found questions were skipped! ({', '.join(msg)})")
+        else:
+            tooltip("No UWorld Step IDs found.")
 
 # Add to Tools Menu
 action = QAction("Get UWorld IDs from History", mw)
